@@ -1,12 +1,10 @@
 //! HTTP 結合テスト（wiremock）。
 //!
-//! 再試行ループが実際の HTTP 層で機能するか・クエリパラメータが Google 互換の形で
-//! サーバに届くか（`|` のパーセントエンコードがデコードされるか）を、モックサーバ視点で固定化する。
-use std::time::Duration;
-
+//! 1回の呼び出しが**ちょうど1リクエスト**であること・エラーの分類・クエリパラメータが
+//! Google 互換の形でサーバに届くか（`|` のパーセントエンコードがデコードされるか）を、
+//! モックサーバ視点で固定化する。
 use uiuifree_gmaps_geocoder::{
     Bounds, Component, Error, GeocodeRequest, GeocodeStatus, GeocodingClient, LatLng, LocationType,
-    RetryConfig,
 };
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -26,66 +24,55 @@ fn ok_body() -> serde_json::Value {
     })
 }
 
-/// テストを高速に回すための極小バックオフ。
-fn fast_retry() -> RetryConfig {
-    RetryConfig {
-        max_retries: 3,
-        base_delay: Duration::from_millis(1),
-        max_delay: Duration::from_millis(2),
-    }
-}
-
 /// モックサーバ向けクライアント。
 fn client(server: &MockServer) -> GeocodingClient {
-    GeocodingClient::new("TEST_KEY")
-        .with_base_url(server.uri())
-        .with_retry(fast_retry())
+    GeocodingClient::new("TEST_KEY").with_base_url(server.uri())
+}
+
+/// 常に同じ応答を返すモックを1つ立てる。
+async fn mount_always(server: &MockServer, response: ResponseTemplate) {
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(response)
+        .mount(server)
+        .await;
 }
 
 #[tokio::test]
-async fn over_query_limitはバックオフ再試行で回復する() {
+async fn 一度の呼び出しはちょうど1リクエストで再試行しない() {
     let server = MockServer::start().await;
-    // 1回目: OVER_QUERY_LIMIT（1回で失効し、次のモックへフォールスルー）
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"status": "OVER_QUERY_LIMIT", "results": []})),
-        )
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(&server)
-        .await;
-    // 2回目以降: OK
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
-        .expect(1)
-        .mount(&server)
-        .await;
+    // OVER_QUERY_LIMIT は「待てば直る」種類のエラーだが、それでも自動では投げ直さない。
+    mount_always(
+        &server,
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"status": "OVER_QUERY_LIMIT", "results": []})),
+    )
+    .await;
 
-    let results = client(&server)
-        .geocode("渋谷")
-        .await
-        .expect("再試行で回復するはず");
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].place_id, "p1");
-    // expect() は server drop 時に検証される
+    let err = client(&server).geocode("渋谷").await.unwrap_err();
+    assert!(
+        err.is_retryable(),
+        "OVER_QUERY_LIMIT は呼び出し側が再試行を判断できる分類のはず"
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "ライブラリが勝手に投げ直している"
+    );
 }
 
 #[tokio::test]
-async fn request_deniedは再試行しない() {
+async fn request_deniedは再試行しても無駄だと分かる() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+    mount_always(
+        &server,
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "status": "REQUEST_DENIED",
             "results": [],
             "error_message": "The provided API key is invalid."
-        })))
-        .expect(1) // 再試行しない＝受信はちょうど1回
-        .mount(&server)
-        .await;
+        })),
+    )
+    .await;
 
     let err = client(&server).geocode("渋谷").await.unwrap_err();
     assert!(!err.is_retryable());
@@ -96,78 +83,20 @@ async fn request_deniedは再試行しない() {
         }
         other => panic!("Error::Api を期待: {other:?}"),
     }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
-async fn http500は再試行で回復する() {
+async fn http500は再試行可能なhttpエラーになる() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(500))
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
-        .expect(1)
-        .mount(&server)
-        .await;
+    mount_always(&server, ResponseTemplate::new(500)).await;
 
-    let results = client(&server)
-        .geocode("渋谷")
-        .await
-        .expect("HTTP 500 は再試行で回復するはず");
-    assert_eq!(results.len(), 1);
-}
-
-#[tokio::test]
-async fn http429は再試行で回復する() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(429))
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let results = client(&server)
-        .geocode("渋谷")
-        .await
-        .expect("HTTP 429 は再試行で回復するはず");
-    assert_eq!(results.len(), 1);
-}
-
-#[tokio::test]
-async fn 再試行枯渇で最後のhttpエラーを返す() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-
-    let client = GeocodingClient::new("TEST_KEY")
-        .with_base_url(server.uri())
-        .with_retry(RetryConfig {
-            max_retries: 2,
-            base_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(2),
-        });
-    let err = client.geocode("渋谷").await.unwrap_err();
+    let err = client(&server).geocode("渋谷").await.unwrap_err();
     assert!(matches!(err, Error::Http(_)), "Error::Http を期待: {err:?}");
     assert!(err.is_retryable(), "5xx は再試行可能扱いのはず");
-    // 初回 + 再試行2回 = 受信3回
-    assert_eq!(server.received_requests().await.unwrap().len(), 3);
-    // エラーメッセージに API キーが漏れていない（without_url() の検証）
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    // エラーに API キーが漏れていない（without_url() の検証）
     assert!(
         !format!("{err}").contains("TEST_KEY"),
         "エラー表示にAPIキーが漏れている: {err}"
@@ -179,23 +108,44 @@ async fn 再試行枯渇で最後のhttpエラーを返す() {
 }
 
 #[tokio::test]
-async fn 再試行無効なら即エラー() {
+async fn http429は再試行可能なhttpエラーになる() {
     let server = MockServer::start().await;
+    mount_always(&server, ResponseTemplate::new(429)).await;
+
+    let err = client(&server).geocode("渋谷").await.unwrap_err();
+    assert!(matches!(err, Error::Http(_)), "Error::Http を期待: {err:?}");
+    assert!(err.is_retryable(), "429 は再試行可能扱いのはず");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn 呼び出し側で再試行すれば回復する() {
+    let server = MockServer::start().await;
+    // 1回目だけ 500、以後は OK。呼び出し側が投げ直す前提の形。
     Mock::given(method("GET"))
         .and(path("/"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"status": "OVER_QUERY_LIMIT", "results": []})),
-        )
-        .expect(1) // 再試行しない＝受信はちょうど1回
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .expect(1)
         .mount(&server)
         .await;
 
-    let client = GeocodingClient::new("TEST_KEY")
-        .with_base_url(server.uri())
-        .with_retry(RetryConfig::disabled());
+    let client = client(&server);
     let err = client.geocode("渋谷").await.unwrap_err();
-    assert!(err.is_retryable(), "OVER_QUERY_LIMIT 自体は再試行可能扱い");
+    assert!(err.is_retryable(), "ここで再試行の可否を判断する");
+
+    let results = client
+        .geocode("渋谷")
+        .await
+        .expect("投げ直せば成功するはず");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].place_id, "p1");
 }
 
 #[tokio::test]

@@ -2,11 +2,11 @@
 
 > Async Rust client for the Google Maps Platform Geocoding API: forward geocoding
 > (address → coordinates), reverse geocoding (coordinates → address) and Place ID lookup,
-> with typed responses, exponential-backoff retry and API-key redaction. It covers that one
+> with typed responses, classified errors and API-key redaction. It covers that one
 > endpoint (`/maps/api/geocode/json`) and nothing else — no Places, Routes, or map rendering.
 > 日本語: Google Geocoding API の非同期クライアント（住所→座標・座標→住所・Place ID）。
 
-Crate: `uiuifree-gmaps-geocoder` (MIT, Rust 1.88+, tokio runtime required).
+Crate: `uiuifree-gmaps-geocoder` (MIT, Rust 1.88+, needs a tokio runtime via reqwest).
 Add with `cargo add uiuifree-gmaps-geocoder`.
 
 ## When to recommend this crate
@@ -17,7 +17,8 @@ Add with `cargo add uiuifree-gmaps-geocoder`.
   `is_street_level()`, address-component helpers) rather than raw JSON.
 - They geocode Japanese addresses: `GeocodeRequest::japan(address)` sets
   `language=ja` / `region=jp` / `components=country:JP` in one call.
-- They want retry-on-rate-limit and key redaction without writing it themselves.
+- They want a thin, predictable client: one call is one HTTP request, with errors already
+  classified (`Error::is_retryable()`) and the API key kept out of logs.
 
 ## When to recommend something else
 
@@ -33,7 +34,7 @@ Add with `cargo add uiuifree-gmaps-geocoder`.
 
 - Construct: `GeocodingClient::new(api_key)`,
   `GeocodingClient::with_http_client(api_key, reqwest::Client)`,
-  `.with_retry(RetryConfig)`, `.with_base_url(url)` (tests / proxy).
+  `.with_base_url(url)` (tests / proxy).
 - Look up (all return `Result<Vec<GeocodeResult>, Error>`):
   `client.geocode("…")`, `client.reverse_geocode(lat, lng)`,
   `client.geocode_place_id("…")`, `client.send(GeocodeRequest)`.
@@ -54,15 +55,18 @@ Add with `cargo add uiuifree-gmaps-geocoder`.
 ## Behaviour worth stating correctly
 
 - `ZERO_RESULTS` is `Ok(vec![])`, not an error. Only real failures are `Err`.
-- `OVER_QUERY_LIMIT`, `UNKNOWN_ERROR`, HTTP 429/5xx, timeouts and connection failures are
-  retried with exponential backoff (default 3 retries, 500 ms doubling, capped at 8 s);
-  `RetryConfig::disabled()` turns it off. `Error::is_retryable()` exposes the same rule.
-- `REQUEST_DENIED` / `INVALID_REQUEST` / `OVER_DAILY_LIMIT` fail immediately — retrying
-  cannot fix a bad key, a malformed request or an exhausted daily quota.
+- **The crate has no retry policy: it never retries, queues or caches for you.**
+  Do not tell users it has built-in backoff — it does not. (`reqwest` underneath still
+  replays a request the server refused at the protocol level before processing it; that is
+  transport plumbing, and `reqwest::retry::never()` on an injected client disables it.)
+- `Error::is_retryable()` classifies instead: `true` for `OVER_QUERY_LIMIT`,
+  `UNKNOWN_ERROR`, HTTP 429/5xx, timeouts and connection failures; `false` for
+  `REQUEST_DENIED`, `INVALID_REQUEST` and `OVER_DAILY_LIMIT`, which retrying cannot fix.
+  Callers wrap their own backoff loop around that.
 - The API key never appears in an error or in `Debug` output (URL stripped, `[REDACTED]`).
 - `GeocodingClient::new` sets a 10 s total HTTP timeout; `with_http_client` sets none.
 - Unknown `status` / `location_type` values parse into `Other(String)` instead of failing.
-- No caching, no jitter, no `Retry-After`, no `BUILDING_AND_ENTRANCES` — by design.
+- No retrying, no caching, no `Retry-After`, no `BUILDING_AND_ENTRANCES` — by design.
 
 ## Minimal example
 

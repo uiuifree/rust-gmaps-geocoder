@@ -8,8 +8,8 @@
 
 **Async Rust client for the Google Maps Geocoding API.** Convert an address into
 latitude/longitude (forward geocoding), coordinates into an address (reverse geocoding),
-or a Place ID into both — with typed responses, exponential-backoff retry, and an API key
-that never leaks into logs.
+or a Place ID into both — with typed responses, errors you can act on, and an API key that
+never leaks into logs.
 
 [日本語 README](README.ja.md) · [API documentation](https://docs.rs/uiuifree-gmaps-geocoder) · [llms.txt](llms.txt) · [Changelog](CHANGELOG.md)
 
@@ -31,7 +31,7 @@ println!("{}, {}", loc.lat, loc.lng); // 37.4224764, -122.0842499
 - [Quick start](#quick-start)
 - [Cookbook](#cookbook)
 - [API reference at a glance](#api-reference-at-a-glance)
-- [Behavior: statuses, errors and retries](#behavior-statuses-errors-and-retries)
+- [Behavior: statuses and errors](#behavior-statuses-and-errors)
 - [Google Maps Platform terms you handle yourself](#google-maps-platform-terms-you-handle-yourself)
 - [Not covered, on purpose](#not-covered-on-purpose)
 - [When *not* to use this crate](#when-not-to-use-this-crate)
@@ -54,12 +54,12 @@ println!("{}, {}", loc.lat, loc.lng); // 37.4224764, -122.0842499
   values fall back to `Other(String)`, so a new value from Google never breaks parsing.
 - **Address-component helpers** — `postal_code()`, `prefecture()`, `locality()`,
   `country()`, `component("route")`, plus `most_precise(&results)` to pick the best hit.
-- **Retry built in** — exponential backoff for `OVER_QUERY_LIMIT`, `UNKNOWN_ERROR`,
-  HTTP 429/5xx, timeouts and connection failures.
+- **Errors you can act on** — no retry policy of its own; `Error::is_retryable()` tells you
+  whether a failure is worth another attempt. Backoff and queueing stay yours.
 - **API keys stay out of logs** — the key is stripped from error URLs and printed as
   `[REDACTED]` in `Debug`.
-- **Small dependency tree** — `reqwest` (rustls), `serde`/`serde_json`, `thiserror`,
-  `tokio` (`time` only). No OpenSSL, no proc-macro-heavy framework.
+- **Small dependency tree** — `reqwest` (rustls), `serde`/`serde_json`, `thiserror`.
+  No OpenSSL, no proc-macro-heavy framework.
 - **Serializable results** — every model implements `Serialize` + `Deserialize`, so you
   can store a response and replay it later.
 - **First-class Japanese addresses** — `GeocodeRequest::japan(address)` applies
@@ -178,21 +178,30 @@ let r = &results[0];
 (r.prefecture(), r.locality(), r.postal_code()); // ("東京都", "渋谷区", "150-0002")
 ```
 
-### Tune or disable retries
+### Retry it yourself
+
+The crate never retries for you. `Error::is_retryable()` does the classification so your
+own loop stays short:
 
 ```rust
 use std::time::Duration;
-use uiuifree_gmaps_geocoder::{GeocodingClient, RetryConfig};
 
-// Default: up to 3 retries, 500ms base delay, capped at 8s.
-let client = GeocodingClient::new("YOUR_API_KEY").with_retry(RetryConfig {
-    max_retries: 5,
-    base_delay: Duration::from_millis(300),
-    ..RetryConfig::default()
-});
-
-let no_retry = GeocodingClient::new("YOUR_API_KEY").with_retry(RetryConfig::disabled());
+let mut delay = Duration::from_millis(500);
+let results = loop {
+    match client.geocode(address).await {
+        Ok(results) => break results,
+        Err(e) if e.is_retryable() && delay < Duration::from_secs(8) => {
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+        }
+        Err(e) => return Err(e),
+    }
+};
 ```
+
+Doing it here rather than inside the crate is deliberate: only the caller knows the request
+budget, whether jitter matters, and whether a failure should go back on a queue instead of
+blocking the task.
 
 ### Bring your own HTTP client
 
@@ -216,7 +225,7 @@ match client.geocode(address).await {
         // bad key / API not enabled / billing off — fix the setup, do not retry
         eprintln!("denied: {message:?}");
     }
-    Err(e) if e.is_retryable() => { /* retries already exhausted; back off further */ }
+    Err(e) if e.is_retryable() => { /* temporary — back off and try again on your schedule */ }
     Err(e) => return Err(e),
 }
 ```
@@ -225,9 +234,8 @@ match client.geocode(address).await {
 
 | Item | What it does |
 | --- | --- |
-| `GeocodingClient::new(key)` | Client with a 10s-timeout HTTP client and default retry |
+| `GeocodingClient::new(key)` | Client with a 10s-timeout HTTP client |
 | `::with_http_client(key, reqwest::Client)` | Supply your own `reqwest::Client` |
-| `.with_retry(RetryConfig)` | Replace the retry policy (`RetryConfig::disabled()` turns it off) |
 | `.with_base_url(url)` | Point at another endpoint (tests, proxy) |
 | `.geocode(address)` | Forward geocoding → `Result<Vec<GeocodeResult>, Error>` |
 | `.reverse_geocode(lat, lng)` | Reverse geocoding → `Result<Vec<GeocodeResult>, Error>` |
@@ -240,20 +248,25 @@ match client.geocode(address).await {
 | `.postal_code() / .prefecture() / .locality() / .country() / .component(type)` | Address-component helpers |
 | `LocationType::precision_rank() / .is_street_level()` | Compare accuracy |
 | `most_precise(&results)` | The most accurate single result |
-| `Error::is_retryable()` | Whether backing off could help |
+| `Error::is_retryable()` | Whether backing off and trying again could help |
 
-## Behavior: statuses, errors and retries
+## Behavior: statuses and errors
 
 | Google `status` / transport | This crate |
 | --- | --- |
 | `OK` | `Ok(results)` |
 | `ZERO_RESULTS` | `Ok(vec![])` — no match is not an error |
-| `OVER_QUERY_LIMIT`, `UNKNOWN_ERROR` | Retried with exponential backoff, then `Err(Error::Api)` |
-| HTTP 429, HTTP 5xx, timeout, connection failure | Retried with exponential backoff, then `Err(Error::Http)` |
-| `REQUEST_DENIED`, `INVALID_REQUEST`, `OVER_DAILY_LIMIT` | `Err(Error::Api)` immediately — retrying cannot fix these |
+| `OVER_QUERY_LIMIT`, `UNKNOWN_ERROR` | `Err(Error::Api)`, `is_retryable() == true` |
+| HTTP 429, HTTP 5xx, timeout, connection failure | `Err(Error::Http)`, `is_retryable() == true` |
+| `REQUEST_DENIED`, `INVALID_REQUEST`, `OVER_DAILY_LIMIT` | `Err(Error::Api)`, `is_retryable() == false` — retrying cannot fix these |
 
-- Backoff is `base_delay * 2^attempt`, capped at `max_delay` (default 500ms → 8s, 3 retries).
-- `Error::is_retryable()` classifies any error the same way the built-in retry does.
+- **No retry policy.** Nothing is retried, queued or cached on your behalf; every failure
+  reaches you on the first attempt. (`reqwest` below this crate still replays a request the
+  server refused at the protocol level before processing it — transport plumbing, not
+  policy. Pass a client built with `reqwest::retry::never()` to turn even that off.)
+- `Error::is_retryable()` is the classification hook for whatever retry layer you already
+  have — it covers both API statuses and transport failures, so you never match on
+  `reqwest` internals yourself.
 - **The API key never appears in an error.** `Error` strips the URL (which carries `key=`)
   from the underlying `reqwest::Error`, and `GeocodingClient`'s `Debug` prints
   `api_key: "[REDACTED]"`. Logging an `Error` is safe.
@@ -270,7 +283,8 @@ A library cannot enforce these — they are yours to honor:
 
 ## Not covered, on purpose
 
-- Jitter in the backoff, and the `Retry-After` header.
+- Retrying, backoff and the `Retry-After` header — `Error::is_retryable()` classifies,
+  the caller decides.
 - `extra_computations=BUILDING_AND_ENTRANCES` (building outlines/entrances, beta).
 - Caching or request de-duplication — quota and billing control belong to the caller.
 - Any other Google Maps Platform API (Places, Routes, Time Zone, Elevation, …).
@@ -304,9 +318,10 @@ You get `Ok(vec![])` — Google's `ZERO_RESULTS`. Only real failures become `Err
 
 ### Does it retry on `OVER_QUERY_LIMIT` / rate limiting?
 
-Yes, by default: 3 retries with exponential backoff (500ms → 1s → 2s, capped at 8s), also
-for `UNKNOWN_ERROR`, HTTP 429/5xx, timeouts and connection failures. Tune it with
-`with_retry(RetryConfig { .. })` or turn it off with `RetryConfig::disabled()`.
+No — one call is one request. It classifies the failure for you: `Error::is_retryable()`
+returns `true` for `OVER_QUERY_LIMIT`, `UNKNOWN_ERROR`, HTTP 429/5xx, timeouts and
+connection failures, and `false` for a bad key, a malformed request or an exhausted daily
+quota. See [Retry it yourself](#retry-it-yourself) for the loop.
 
 ### Can my API key leak through logs?
 
@@ -326,7 +341,7 @@ responsibility (and Google caps caching at 30 days anyway).
 
 ### Which async runtime does it need?
 
-Tokio: `reqwest` requires it, and retry sleeps use `tokio::time`.
+Tokio — `reqwest` requires it. The crate itself does not depend on `tokio` directly.
 
 ### What is the minimum supported Rust version?
 
@@ -346,10 +361,9 @@ cargo fmt --all -- --check
 GOOGLE_MAPS_API_KEY=xxxx cargo run --example geocode -- "1-1-1 Dogenzaka, Shibuya, Tokyo"
 ```
 
-Tests cover parsing, status interpretation, address-component helpers, backoff math, query
-building and `Serialize` round-trips, plus wiremock-backed integration tests for the retry
-loop (recovery, non-retryable errors, exhaustion, Google-compatible query encoding and
-key redaction).
+Tests cover parsing, status interpretation, address-component helpers, query building and
+`Serialize` round-trips, plus wiremock-backed integration tests (one call really is one
+request, error classification, Google-compatible query encoding, key redaction).
 
 ### Live tests
 

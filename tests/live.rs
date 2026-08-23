@@ -12,8 +12,7 @@
 //! the responses still fit the model, and that a real `REQUEST_DENIED` keeps the key out of
 //! the error.
 use uiuifree_gmaps_geocoder::{
-    most_precise, Component, Error, GeocodeRequest, GeocodeResponse, GeocodeStatus,
-    GeocodingClient, RetryConfig,
+    most_precise, Component, Error, GeocodeRequest, GeocodeResponse, GeocodeStatus, GeocodingClient,
 };
 
 /// 実 API のキー。無ければ「実行の仕方を間違えた」ので落とす。
@@ -167,8 +166,7 @@ async fn 存在しない住所はzero_resultsで空になる() {
 #[ignore = "calls the real Google API (billed); needs GOOGLE_MAPS_API_KEY"]
 async fn 不正なキーはrequest_deniedになりキーがエラーに出ない() {
     const BAD_KEY: &str = "AIza-this-key-is-not-valid-0123456789";
-    // 再試行しても直らないので待たない。
-    let client = GeocodingClient::new(BAD_KEY).with_retry(RetryConfig::disabled());
+    let client = GeocodingClient::new(BAD_KEY);
 
     let err = client
         .geocode("Mountain View, CA")

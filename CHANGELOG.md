@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-23
+
 ### Added
 
 - `GeocodeRequest::japan(address)`（日本向け既定 = `language=ja` / `region=jp` / `components=country:JP`）
@@ -22,6 +24,16 @@
 
 - `most_precise()` が同じ精度の結果が並んだとき最後の1件を返していた。
   ドキュメントどおり Google の並び順を尊重して先頭を返す
+
+### Removed
+
+- **再試行機構（`RetryConfig` / `GeocodingClient::with_retry`）を削除。**
+  1回の呼び出しは1リクエストになり、投げ直しは呼び出し側の責務にした。
+  分類は `Error::is_retryable()` / `GeocodeStatus::is_retryable()` として残す
+  （1リクエストにいくら使えるか・ジッターが要るか・失敗をキューに戻すかは
+  呼び出し側しか判断できないため）
+- 直接依存から `tokio` を削除（再試行の待機にしか使っていなかった）。
+  `reqwest` 経由で tokio ランタイムが要る点は変わらない
 
 ### Changed
 
@@ -48,6 +60,7 @@
 - 指数バックオフ再試行（既定: 最大3回・初回500ms・上限8s）。対象は
   `OVER_QUERY_LIMIT` / `UNKNOWN_ERROR` / HTTP 429・5xx / タイムアウト・接続失敗。
   `RetryConfig` で調整、`RetryConfig::disabled()` で無効化
+  （**0.1.1 で削除**。呼び出し側の責務にした）
 - 既定 HTTP クライアントに全体タイムアウト10秒（`with_http_client` で上書き可）
 - API キー漏洩対策: `Error` は `reqwest::Error` から URL（`key=` クエリ込み）を除去して保持。
   `GeocodingClient` の `Debug` はキーを `[REDACTED]` 表示
@@ -60,5 +73,6 @@
 - `extra_computations=BUILDING_AND_ENTRANCES`（建物外形・入口ベータ）未対応
 - キャッシュなし（同一住所の再問い合わせ抑制・課金管理は呼び出し側の責務）
 
-[Unreleased]: https://github.com/uiuifree/rust-gmaps-geocoder/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/uiuifree/rust-gmaps-geocoder/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/uiuifree/rust-gmaps-geocoder/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/uiuifree/rust-gmaps-geocoder/releases/tag/v0.1.0

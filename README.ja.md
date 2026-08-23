@@ -7,8 +7,8 @@
 [![license: MIT](https://img.shields.io/crates/l/uiuifree-gmaps-geocoder.svg)](LICENSE)
 
 **Google Maps Geocoding API の非同期 Rust クライアント。** 住所から緯度経度（forward）、
-座標から住所（reverse）、Place ID から両方を引く。結果は型付き、一時的な失敗は指数バックオフで
-自動再試行、API キーはログに出ない。
+座標から住所（reverse）、Place ID から両方を引く。結果は型付き、失敗は呼び出し側が判断できる形で
+返り、API キーはログに出ない。
 
 [English README](README.md) · [APIドキュメント](https://docs.rs/uiuifree-gmaps-geocoder) · [llms.txt](llms.txt) · [変更履歴](CHANGELOG.md)
 
@@ -23,7 +23,7 @@ Places / Routes / Static Maps・地図描画は入れない（Google Maps Platfo
 - [使い方](#使い方)
 - [レシピ集](#レシピ集)
 - [API 早見表](#api-早見表)
-- [挙動: ステータス・エラー・再試行](#挙動-ステータスエラー再試行)
+- [挙動: ステータスとエラー](#挙動-ステータスとエラー)
 - [Google の規約（呼び出し側の責務）](#google-の規約呼び出し側の責務)
 - [未対応（意図的な割り切り）](#未対応意図的な割り切り)
 - [使わないほうがいい場合](#使わないほうがいい場合)
@@ -45,10 +45,10 @@ Places / Routes / Static Maps・地図描画は入れない（Google Maps Platfo
   落ちるので、Google 側に新しい値が増えてもパースは壊れない
 - **住所要素ヘルパー** — `postal_code()` / `prefecture()` / `locality()` / `country()` /
   `component("route")`、加えて一番正確な1件を選ぶ `most_precise(&results)`
-- **再試行を標準装備** — `OVER_QUERY_LIMIT` / `UNKNOWN_ERROR` / HTTP 429・5xx /
-  タイムアウト・接続失敗を指数バックオフで自動再試行
+- **失敗を判断できる形で返す** — 再試行の方針を持たず、`Error::is_retryable()` が
+  「待って投げ直す価値があるか」を答える。バックオフとキューイングは呼び出し側の領分
 - **API キーがログに出ない** — エラーからは URL ごと除去され、`Debug` は `[REDACTED]` 表示
-- **依存が薄い** — `reqwest`(rustls) / `serde`・`serde_json` / `thiserror` / `tokio`（`time` のみ）。
+- **依存が薄い** — `reqwest`(rustls) / `serde`・`serde_json` / `thiserror`。
   OpenSSL も重量級フレームワークも要らない
 - **結果を保存できる** — 全モデルが `Serialize` + `Deserialize`。取得結果をそのまま保存・再送できる
 - **日本の住所に強い** — `GeocodeRequest::japan(address)` 一発で
@@ -169,21 +169,29 @@ let resp = client.send_response(GeocodeRequest::reverse(35.658, 139.6994)).await
 println!("{:?}", resp.plus_code);
 ```
 
-### 再試行の調整
+### 再試行は呼び出し側で書く
+
+このクレートは投げ直しをしない。分類は `Error::is_retryable()` が引き受けるので、
+自前のループは短く済む:
 
 ```rust
 use std::time::Duration;
-use uiuifree_gmaps_geocoder::{GeocodingClient, RetryConfig};
 
-// 既定は「最大3回・初回500ms・上限8s」
-let client = GeocodingClient::new("YOUR_API_KEY").with_retry(RetryConfig {
-    max_retries: 5,
-    base_delay: Duration::from_millis(300),
-    ..RetryConfig::default()
-});
-
-let no_retry = GeocodingClient::new("YOUR_API_KEY").with_retry(RetryConfig::disabled());
+let mut delay = Duration::from_millis(500);
+let results = loop {
+    match client.geocode(address).await {
+        Ok(results) => break results,
+        Err(e) if e.is_retryable() && delay < Duration::from_secs(8) => {
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+        }
+        Err(e) => return Err(e),
+    }
+};
 ```
+
+クレート側に入れないのは意図的で、1リクエストにいくら使えるか・ジッターが要るか・
+失敗をキューに戻すべきかを知っているのは呼び出し側だけだからです。
 
 ### HTTP クライアントを差し替える
 
@@ -207,7 +215,7 @@ match client.geocode(address).await {
         // キー不正・API 未有効化・課金停止。再試行しても直らないので設定を直す
         eprintln!("denied: {message:?}");
     }
-    Err(e) if e.is_retryable() => { /* 内蔵の再試行を使い切った状態。さらに待つか諦める */ }
+    Err(e) if e.is_retryable() => { /* 一時的な失敗。自分の都合で待って投げ直す */ }
     Err(e) => return Err(e),
 }
 ```
@@ -216,9 +224,8 @@ match client.geocode(address).await {
 
 | 項目 | 役割 |
 | --- | --- |
-| `GeocodingClient::new(key)` | 全体タイムアウト10秒・既定の再試行つきクライアント |
+| `GeocodingClient::new(key)` | 全体タイムアウト10秒のクライアント |
 | `::with_http_client(key, reqwest::Client)` | `reqwest::Client` を自前で用意する |
-| `.with_retry(RetryConfig)` | 再試行設定を差し替える（`RetryConfig::disabled()` で無効化） |
 | `.with_base_url(url)` | 接続先を差し替える（テスト・プロキシ） |
 | `.geocode(address)` | 住所 → 座標 → `Result<Vec<GeocodeResult>, Error>` |
 | `.reverse_geocode(lat, lng)` | 座標 → 住所 → `Result<Vec<GeocodeResult>, Error>` |
@@ -231,20 +238,25 @@ match client.geocode(address).await {
 | `.postal_code() / .prefecture() / .locality() / .country() / .component(type)` | 住所要素ヘルパー |
 | `LocationType::precision_rank() / .is_street_level()` | 精度の比較・判定 |
 | `most_precise(&results)` | 一番正確な1件 |
-| `Error::is_retryable()` | 待って再試行する価値があるか |
+| `Error::is_retryable()` | 待って投げ直す価値があるか |
 
-## 挙動: ステータス・エラー・再試行
+## 挙動: ステータスとエラー
 
 | Google の `status` / 通信 | このクレートの扱い |
 | --- | --- |
 | `OK` | `Ok(results)` |
 | `ZERO_RESULTS` | `Ok(vec![])` — 該当なしはエラーにしない |
-| `OVER_QUERY_LIMIT`・`UNKNOWN_ERROR` | 指数バックオフで再試行 → 使い切ったら `Err(Error::Api)` |
-| HTTP 429・5xx・タイムアウト・接続失敗 | 指数バックオフで再試行 → 使い切ったら `Err(Error::Http)` |
-| `REQUEST_DENIED`・`INVALID_REQUEST`・`OVER_DAILY_LIMIT` | 再試行せず即 `Err(Error::Api)` |
+| `OVER_QUERY_LIMIT`・`UNKNOWN_ERROR` | `Err(Error::Api)`・`is_retryable() == true` |
+| HTTP 429・5xx・タイムアウト・接続失敗 | `Err(Error::Http)`・`is_retryable() == true` |
+| `REQUEST_DENIED`・`INVALID_REQUEST`・`OVER_DAILY_LIMIT` | `Err(Error::Api)`・`is_retryable() == false`（投げ直しても直らない） |
 
-- 待ち時間は `base_delay * 2^attempt`（`max_delay` で頭打ち。既定は 500ms→8s・最大3回）
-- `Error::is_retryable()` は内蔵の再試行とまったく同じ基準で分類する
+- **再試行の方針を持たない。** 勝手な投げ直し・キューイング・キャッシュはせず、失敗は
+  1回目でそのまま返る（クレートの下の `reqwest` は、サーバが処理前にプロトコル層で
+  拒否したリクエストだけ投げ直す。方針ではなく通信の裏方で、サーバが処理したものが
+  二度送られることはない。これも止めるなら `reqwest::retry::never()` で組んだクライアントを
+  `with_http_client` に渡す）
+- `Error::is_retryable()` は、既にある再試行層に繋ぐための分類。API のステータスと通信の失敗を
+  まとめて判定するので、`reqwest` の内部を呼び出し側で場合分けしなくてよい
 - **API キーはエラーに出ない。** `Error` は `reqwest::Error` から URL（`key=` を含む）を
   除去して保持し、`GeocodingClient` の `Debug` は `api_key: "[REDACTED]"` と表示する。
   エラーはそのままログに流してよい
@@ -261,7 +273,8 @@ match client.geocode(address).await {
 
 ## 未対応（意図的な割り切り）
 
-- バックオフのジッター・`Retry-After` ヘッダの解釈
+- 再試行・バックオフ・`Retry-After` ヘッダの解釈（分類は `Error::is_retryable()` が担い、
+  待つかどうかは呼び出し側が決める）
 - `extra_computations=BUILDING_AND_ENTRANCES`（建物外形・入口のベータ）
 - キャッシュ・リクエストの重複排除（同一住所の再問い合わせ抑制・課金管理は呼び出し側の責務）
 - Geocoding 以外の Google Maps Platform API（Places / Routes / Time Zone / Elevation …）
@@ -294,9 +307,10 @@ match client.geocode(address).await {
 
 ### `OVER_QUERY_LIMIT`（レート上限）は再試行される？
 
-される。既定で最大3回・指数バックオフ（500ms→1s→2s、上限8s）。`UNKNOWN_ERROR`・
-HTTP 429・5xx・タイムアウト・接続失敗も同じ。`with_retry(RetryConfig { .. })` で調整、
-`RetryConfig::disabled()` で無効化。
+されない（1回の呼び出しは1リクエスト）。代わりに分類だけ返す。`Error::is_retryable()` は
+`OVER_QUERY_LIMIT`・`UNKNOWN_ERROR`・HTTP 429・5xx・タイムアウト・接続失敗で `true`、
+キー不正・不正リクエスト・日次枠切れで `false`。ループの書き方は
+[再試行は呼び出し側で書く](#再試行は呼び出し側で書く)。
 
 ### ログから API キーが漏れない？
 
@@ -316,7 +330,7 @@ HTTP 429・5xx・タイムアウト・接続失敗も同じ。`with_retry(RetryC
 
 ### 必要な非同期ランタイムは？
 
-Tokio。`reqwest` が要求し、再試行の待機にも `tokio::time` を使う。
+Tokio。`reqwest` が要求する。クレート自体は `tokio` に直接依存していない。
 
 ### 対応する Rust の下限バージョンは？
 
@@ -336,9 +350,9 @@ cargo fmt --all -- --check
 GOOGLE_MAPS_API_KEY=xxxx cargo run --example geocode -- "東京都渋谷区道玄坂1-1-1"
 ```
 
-テストはパース・ステータス解釈・住所要素ヘルパー・バックオフ計算・クエリ組み立て・
-`Serialize` 往復に加え、wiremock による HTTP 結合テストで再試行ループの実挙動
-（回復・非再試行・枯渇・クエリエンコードの Google 互換性・キー非漏洩）を検証する。
+テストはパース・ステータス解釈・住所要素ヘルパー・クエリ組み立て・`Serialize` 往復に加え、
+wiremock による HTTP 結合テストで実挙動（1回の呼び出しが本当に1リクエストか・エラーの分類・
+クエリエンコードの Google 互換性・キー非漏洩）を検証する。
 
 ### ライブテスト（実 API）
 

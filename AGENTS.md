@@ -7,9 +7,13 @@ AIエージェント・コントリビューター向けの開発ガイド。
 Google Maps Platform の Geocoding API（住所→座標・座標→住所・Place ID→住所）だけを扱う非同期クライアント。
 ほかの Maps API（Places / Routes / Static Maps 等）は入れない。
 
-- 依存は `reqwest`（rustls）/ `serde` / `serde_json` / `thiserror` / `tokio`（time = 再試行の待機）に留める
+- 依存は `reqwest`（rustls）/ `serde` / `serde_json` / `thiserror` に留める
 - 公開 API は `GeocodingClient` + `GeocodeRequest`（ビルダ）+ 結果型（`GeocodeResult` ほか）に集約する
-- `status` が `OK` / `ZERO_RESULTS` 以外は `Error` にする（成功扱いにしない）。再試行対象は `is_retryable()` で判定
+- `status` が `OK` / `ZERO_RESULTS` 以外は `Error` にする（成功扱いにしない）
+- **再試行・バックオフ・キャッシュをクレートに入れない**（呼び出し側の領分。
+  クレートは `is_retryable()` で分類だけ返す）。`reqwest` 既定のプロトコル NACK 再試行は
+  通信の裏方なので残している（止めるなら利用者が `reqwest::retry::never()` で組んだ
+  クライアントを `with_http_client` に渡す）
 - API キーはログ・`Debug`・エラー文面に出さない（`[REDACTED]`・URL から `key=` を除去）
 - 未知の `status` / `location_type` は `Other(String)` で受ける（前方互換）
 - 既定のテストはネットワーク不要（`wiremock` のモックサーバー + JSON のパース）。
@@ -29,7 +33,7 @@ GOOGLE_MAPS_API_KEY=... cargo test --test live -- --ignored --nocapture   # 実 
 ## 構成
 
 - `src/lib.rs` — crate ドキュメント・再エクスポート
-- `src/client.rs` — `GeocodingClient`（HTTP・再試行）と `GeocodeRequest`（ビルダ。`japan()` = 日本向け既定）
+- `src/client.rs` — `GeocodingClient`（HTTP）と `GeocodeRequest`（ビルダ。`japan()` = 日本向け既定）
 - `src/types.rs` — `GeocodeStatus` / `LocationType`（`precision_rank` / `is_street_level`）/ `Component`
 - `src/model.rs` — レスポンスの型・住所要素ヘルパー・`most_precise`
 - `src/error.rs` — `Error`（`is_retryable`）

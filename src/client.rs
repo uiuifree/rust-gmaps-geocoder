@@ -1,4 +1,4 @@
-//! The client, its retry policy, and the request builder.
+//! The client and the request builder.
 use crate::error::Error;
 use crate::model::{Bounds, GeocodeResponse, GeocodeResult};
 use crate::types::{Component, GeocodeStatus, LocationType};
@@ -7,83 +7,19 @@ use std::time::Duration;
 /// The JSON endpoint of the Geocoding API.
 const DEFAULT_BASE_URL: &str = "https://maps.googleapis.com/maps/api/geocode/json";
 
-/// How the client retries failures that look temporary.
-///
-/// The delay before attempt `n` is `base_delay * 2^n`, capped at `max_delay` — with the
-/// defaults that is 500 ms, 1 s, 2 s. Retries cover `OVER_QUERY_LIMIT`, `UNKNOWN_ERROR`,
-/// HTTP 429 and 5xx, timeouts and connection failures; see [`Error::is_retryable`].
-///
-/// There is no jitter and the `Retry-After` header is ignored, both on purpose.
-///
-/// ```
-/// use std::time::Duration;
-/// use uiuifree_gmaps_geocoder::RetryConfig;
-///
-/// // Defaults: 3 retries, 500ms doubling, capped at 8s.
-/// let default = RetryConfig::default();
-/// assert_eq!(default.max_retries, 3);
-///
-/// // More patient, and quicker off the mark.
-/// let patient = RetryConfig {
-///     max_retries: 5,
-///     base_delay: Duration::from_millis(300),
-///     ..RetryConfig::default()
-/// };
-///
-/// // Or fail on the first error.
-/// assert_eq!(RetryConfig::disabled().max_retries, 0);
-/// # let _ = patient;
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetryConfig {
-    /// How many *extra* attempts to make after the first one. `0` disables retrying.
-    pub max_retries: u32,
-    /// How long to wait before the first retry. Each further retry doubles it.
-    pub base_delay: Duration,
-    /// Ceiling for the doubling, so a long run of failures cannot stall a request forever.
-    pub max_delay: Duration,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            base_delay: Duration::from_millis(500),
-            max_delay: Duration::from_secs(8),
-        }
-    }
-}
-
-impl RetryConfig {
-    /// Never retry: fail on the first error, whatever it is.
-    ///
-    /// Use it when the caller already has its own retry or queueing layer, or when a
-    /// request is on a latency budget that a backoff would blow.
-    pub fn disabled() -> Self {
-        Self {
-            max_retries: 0,
-            ..Self::default()
-        }
-    }
-
-    /// `attempt` 回目（0始まり）の待機時間 = `base_delay * 2^attempt`（`max_delay` で頭打ち）。
-    fn delay_for(&self, attempt: u32) -> Duration {
-        // シフトは u32 に収まる 31 まで（それ以上は saturating_mul と max_delay が頭打ちにする）。
-        // 16 で止めると、max_delay が十分大きい設定で 16 回目以降だけ倍々が止まってしまう。
-        let mult = 1u32 << attempt.min(31);
-        self.base_delay.saturating_mul(mult).min(self.max_delay)
-    }
-}
-
 /// An async client for the Google Maps Geocoding API.
 ///
 /// Build one per API key and share it: it wraps a `reqwest::Client`, so `clone` is cheap
-/// and clones share the same connection pool. Retrying is on by default ([`RetryConfig`]).
+/// and clones share the same connection pool.
 ///
 /// The three shorthands — [`geocode`](Self::geocode),
 /// [`reverse_geocode`](Self::reverse_geocode), [`geocode_place_id`](Self::geocode_place_id)
 /// — cover the common cases; [`send`](Self::send) takes a [`GeocodeRequest`] when you need
 /// language, region, bias or filters.
+///
+/// **No retry policy of its own.** A rate limit, a 5xx or a timeout surfaces as an `Err` on
+/// the first attempt; [`Error::is_retryable`] tells you whether another attempt could help,
+/// and when to back off is yours to decide.
 ///
 /// `Debug` prints the API key as `[REDACTED]`.
 ///
@@ -104,7 +40,6 @@ pub struct GeocodingClient {
     api_key: String,
     http: reqwest::Client,
     base_url: String,
-    retry: RetryConfig,
 }
 
 /// `api_key` を含めない手動実装（derive すると Debug 出力にキーが漏れる）。
@@ -113,19 +48,17 @@ impl std::fmt::Debug for GeocodingClient {
         f.debug_struct("GeocodingClient")
             .field("api_key", &"[REDACTED]")
             .field("base_url", &self.base_url)
-            .field("retry", &self.retry)
             .finish_non_exhaustive()
     }
 }
 
 impl GeocodingClient {
-    /// A client for the given [API key][key], with a default HTTP client and default
-    /// retry policy.
+    /// A client for the given [API key][key], with a default HTTP client.
     ///
-    /// The default HTTP client carries a **10 second total timeout**, because without one
-    /// a stalled connection would hang forever and the retry loop would never get its
-    /// turn. Pass your own client to [`with_http_client`](Self::with_http_client) to
-    /// change that, or anything else (proxy, connection pool, headers).
+    /// The default HTTP client carries a **10 second total timeout**, so a stalled
+    /// connection fails instead of hanging forever. Pass your own client to
+    /// [`with_http_client`](Self::with_http_client) to change that, or anything else
+    /// (proxy, connection pool, headers).
     ///
     /// Where the key comes from is up to you — this crate only stores the string, and
     /// keeps it out of `Debug` output and error messages.
@@ -148,21 +81,13 @@ impl GeocodingClient {
     /// proxy, a shared connection pool, or your own middleware stack.
     ///
     /// Unlike [`new`](Self::new), no timeout is imposed here; set one on the client you
-    /// pass in, or a hung connection will never reach the retry loop.
+    /// pass in, or a hung connection will never return.
     pub fn with_http_client(api_key: impl Into<String>, http: reqwest::Client) -> Self {
         Self {
             api_key: api_key.into(),
             http,
             base_url: DEFAULT_BASE_URL.to_string(),
-            retry: RetryConfig::default(),
         }
-    }
-
-    /// Replace the retry policy — see [`RetryConfig`], and `RetryConfig::disabled()` to
-    /// turn retrying off.
-    pub fn with_retry(mut self, retry: RetryConfig) -> Self {
-        self.retry = retry;
-        self
     }
 
     /// Send requests somewhere other than Google: a mock server in tests, or a proxy that
@@ -189,7 +114,8 @@ impl GeocodingClient {
     /// # Errors
     ///
     /// [`Error::Api`] for any status other than `OK`/`ZERO_RESULTS`, [`Error::Http`] for
-    /// transport failures — in both cases only after the retries are exhausted.
+    /// transport failures. One attempt is made; use [`Error::is_retryable`] to decide
+    /// whether to try again.
     ///
     /// ```no_run
     /// # async fn run(client: &uiuifree_gmaps_geocoder::GeocodingClient) -> Result<(), uiuifree_gmaps_geocoder::Error> {
@@ -242,8 +168,8 @@ impl GeocodingClient {
         self.send(GeocodeRequest::place_id(place_id)).await
     }
 
-    /// Send a request built with [`GeocodeRequest`] — the full-control entry point, with
-    /// retrying — and return its results.
+    /// Send a request built with [`GeocodeRequest`] — the full-control entry point — and
+    /// return its results.
     ///
     /// # Errors
     ///
@@ -275,26 +201,10 @@ impl GeocodingClient {
     ///
     /// Same as [`geocode`](Self::geocode).
     pub async fn send_response(&self, req: GeocodeRequest<'_>) -> Result<GeocodeResponse, Error> {
-        let params = req.to_params(&self.api_key);
-        let mut attempt = 0u32;
-        loop {
-            match self.try_once(&params).await {
-                Ok(resp) => return Ok(resp),
-                Err(e) if attempt < self.retry.max_retries && e.is_retryable() => {
-                    tokio::time::sleep(self.retry.delay_for(attempt)).await;
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// 1回だけ HTTP を叩いて結果を解釈する（再試行しない）。
-    async fn try_once(&self, params: &[(&str, String)]) -> Result<GeocodeResponse, Error> {
         let response: GeocodeResponse = self
             .http
             .get(&self.base_url)
-            .query(params)
+            .query(&req.to_params(&self.api_key))
             .send()
             .await?
             .error_for_status()?
@@ -666,34 +576,6 @@ mod tests {
         let resp: GeocodeResponse =
             serde_json::from_str(r#"{"status":"OVER_QUERY_LIMIT","results":[]}"#).unwrap();
         assert!(interpret(resp).unwrap_err().is_retryable());
-    }
-
-    #[test]
-    fn バックオフは指数で伸び上限で頭打ち() {
-        let cfg = RetryConfig {
-            max_retries: 5,
-            base_delay: Duration::from_millis(500),
-            max_delay: Duration::from_secs(8),
-        };
-        assert_eq!(cfg.delay_for(0), Duration::from_millis(500));
-        assert_eq!(cfg.delay_for(1), Duration::from_secs(1));
-        assert_eq!(cfg.delay_for(2), Duration::from_secs(2));
-        assert_eq!(cfg.delay_for(3), Duration::from_secs(4));
-        assert_eq!(cfg.delay_for(4), Duration::from_secs(8));
-        assert_eq!(cfg.delay_for(20), Duration::from_secs(8));
-    }
-
-    #[test]
-    fn 上限が大きければ16回目以降も倍々で伸びる() {
-        let cfg = RetryConfig {
-            max_retries: 40,
-            base_delay: Duration::from_millis(1),
-            max_delay: Duration::from_secs(300),
-        };
-        assert_eq!(cfg.delay_for(16), Duration::from_millis(65_536));
-        assert_eq!(cfg.delay_for(17), Duration::from_millis(131_072));
-        // 最後は max_delay で頭打ちになる。
-        assert_eq!(cfg.delay_for(40), Duration::from_secs(300));
     }
 
     #[test]

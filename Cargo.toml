@@ -1,11 +1,11 @@
 [package]
 name = "uiuifree-gmaps-geocoder"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # 実測値: 依存（cpufeatures 0.3 が edition2024、idna_adapter が 1.86+）の下限から決定。CI の MSRV ジョブと一致させること
 rust-version = "1.88"
 license = "MIT"
-description = "Async Rust client for the Google Maps Geocoding API: forward geocoding (address to coordinates), reverse geocoding (coordinates to address) and Place ID lookup, with typed responses and retry"
+description = "Async Rust client for the Google Maps Geocoding API: forward geocoding (address to coordinates), reverse geocoding (coordinates to address) and Place ID lookup, with typed responses"
 repository = "https://github.com/uiuifree/rust-gmaps-geocoder"
 homepage = "https://github.com/uiuifree/rust-gmaps-geocoder"
 documentation = "https://docs.rs/uiuifree-gmaps-geocoder"
@@ -21,8 +21,6 @@ serde = { version = "1", features = ["derive"] }
 # address_descriptor（ベータ）を生の JSON のまま保持するために使用
 serde_json = "1"
 thiserror = "2"
-# 指数バックオフ再試行の待機に使用（reqwest が既に tokio を要求するため追加コストは小さい）
-tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

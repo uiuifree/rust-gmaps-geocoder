@@ -21,7 +21,7 @@ use thiserror::Error;
 ///     Err(Error::Api { status: GeocodeStatus::RequestDenied, message }) => {
 ///         eprintln!("denied: {message:?}");
 ///     }
-///     // The built-in retry already gave up; back off further or give up.
+///     // Temporary: back off and try again, on whatever schedule suits the caller.
 ///     Err(e) if e.is_retryable() => eprintln!("temporary failure: {e}"),
 ///     Err(e) => eprintln!("{e}"),
 /// }
@@ -72,9 +72,9 @@ impl Error {
     /// other than 429, a JSON decoding failure) is a configuration or request problem
     /// that another attempt will not fix.
     ///
-    /// [`GeocodingClient`](crate::GeocodingClient) already retries these on its own; this
-    /// method is for callers who want to make that decision themselves — for instance to
-    /// requeue a job after the built-in retries are exhausted.
+    /// This crate never retries on your behalf, so this is the hook for whatever retry or
+    /// queueing layer you already have: back off and try again when it returns `true`,
+    /// surface the failure when it returns `false`.
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::Http(e) => {

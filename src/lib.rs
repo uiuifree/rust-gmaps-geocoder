@@ -9,8 +9,8 @@
 //! | Place ID → address and coordinates | [`GeocodingClient::geocode_place_id`] |
 //! | Any of the three, with options | [`GeocodeRequest`] passed to [`GeocodingClient::send`] |
 //!
-//! Results are typed ([`GeocodeResult`], [`LocationType`], [`GeocodeStatus`]), transient
-//! failures are retried with exponential backoff, and the API key never reaches a log line.
+//! Results are typed ([`GeocodeResult`], [`LocationType`], [`GeocodeStatus`]), failures come
+//! back classified instead of retried, and the API key never reaches a log line.
 //!
 //! # Quick start
 //!
@@ -91,27 +91,33 @@
 //! }
 //! ```
 //!
-//! # Errors and retries
+//! # Errors
 //!
 //! | Google `status` / transport | This crate |
 //! | --- | --- |
 //! | `OK` | `Ok(results)` |
 //! | `ZERO_RESULTS` | `Ok(vec![])` — no match is not an error |
-//! | `OVER_QUERY_LIMIT`, `UNKNOWN_ERROR` | retried, then [`Error::Api`] |
-//! | HTTP 429/5xx, timeout, connection failure | retried, then [`Error::Http`] |
-//! | `REQUEST_DENIED`, `INVALID_REQUEST`, `OVER_DAILY_LIMIT` | [`Error::Api`] right away |
+//! | `OVER_QUERY_LIMIT`, `UNKNOWN_ERROR` | [`Error::Api`] — worth retrying |
+//! | HTTP 429/5xx, timeout, connection failure | [`Error::Http`] — worth retrying |
+//! | `REQUEST_DENIED`, `INVALID_REQUEST`, `OVER_DAILY_LIMIT` | [`Error::Api`] — retrying will not help |
 //!
-//! Retrying is on by default ([`RetryConfig`]: 3 retries, 500 ms doubling up to 8 s) and can
-//! be tuned or switched off with [`GeocodingClient::with_retry`]. [`Error::is_retryable`]
-//! applies the same classification if you want to drive retries yourself.
+//! **This crate has no retry policy.** Every failure above reaches you on the first attempt:
+//! backoff, jitter, queueing and quota control belong to the caller, which is where the
+//! context to make those choices lives. [`Error::is_retryable`] classifies an error so you
+//! can drive that decision without matching on transport details yourself.
+//!
+//! One exception sits below this crate: `reqwest` replays a request the server refused at
+//! the protocol level (an HTTP/2 NACK) before processing it. That is transport plumbing,
+//! not a policy — nothing the server acted on is ever sent twice. Pass a client built with
+//! `reqwest::retry::never()` to [`GeocodingClient::with_http_client`] to turn even that off.
 //!
 //! The API key is stripped from every error ([`Error::Http`] carries no URL) and printed as
 //! `[REDACTED]` by `GeocodingClient`'s `Debug`, so errors are safe to log.
 //!
 //! # Deliberate omissions
 //!
-//! No caching (Google allows at most 30 days anyway), no jitter or `Retry-After` handling,
-//! no `extra_computations=BUILDING_AND_ENTRANCES`, and no other Google Maps Platform API.
+//! No retrying, no caching (Google allows at most 30 days anyway), no
+//! `extra_computations=BUILDING_AND_ENTRANCES`, and no other Google Maps Platform API.
 //! Quota, billing and request de-duplication stay with the caller.
 //!
 //! # Google Maps Platform terms
@@ -130,7 +136,7 @@ mod error;
 mod model;
 mod types;
 
-pub use client::{GeocodeRequest, GeocodingClient, RetryConfig};
+pub use client::{GeocodeRequest, GeocodingClient};
 pub use error::Error;
 pub use model::{
     most_precise, AddressComponent, Bounds, GeocodeResponse, GeocodeResult, Geometry, LatLng,
