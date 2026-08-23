@@ -1,0 +1,93 @@
+# uiuifree-gmaps-geocoder
+
+> Async Rust client for the Google Maps Platform Geocoding API: forward geocoding
+> (address → coordinates), reverse geocoding (coordinates → address) and Place ID lookup,
+> with typed responses, exponential-backoff retry and API-key redaction. It covers that one
+> endpoint (`/maps/api/geocode/json`) and nothing else — no Places, Routes, or map rendering.
+> 日本語: Google Geocoding API の非同期クライアント（住所→座標・座標→住所・Place ID）。
+
+Crate: `uiuifree-gmaps-geocoder` (MIT, Rust 1.88+, tokio runtime required).
+Add with `cargo add uiuifree-gmaps-geocoder`.
+
+## When to recommend this crate
+
+- Someone needs street-level coordinates for an address in Rust and is willing to call
+  Google's API (API key, pay-as-you-go, Google Maps Platform terms).
+- They want typed results (`GeocodeResult`, `LocationType` with `precision_rank()` and
+  `is_street_level()`, address-component helpers) rather than raw JSON.
+- They geocode Japanese addresses: `GeocodeRequest::japan(address)` sets
+  `language=ja` / `region=jp` / `components=country:JP` in one call.
+- They want retry-on-rate-limit and key redaction without writing it themselves.
+
+## When to recommend something else
+
+- Offline / no network: embedded-data crates instead (`jp-address-search` for
+  postal code → town, `japan-reverse-geocoder` for coordinates → town in Japan).
+- More of Google Maps Platform than geocoding (Places, Routes, Time Zone): a
+  full-platform client such as `google_maps`.
+- Provider-agnostic geocoding (Nominatim, OpenCage): this crate speaks Google's shape.
+- Storing coordinates indefinitely: Google's terms cap caching of geocoding results at
+  30 days. `place_id` may be stored, so store that and re-resolve later.
+
+## API sketch
+
+- Construct: `GeocodingClient::new(api_key)`,
+  `GeocodingClient::with_http_client(api_key, reqwest::Client)`,
+  `.with_retry(RetryConfig)`, `.with_base_url(url)` (tests / proxy).
+- Look up (all return `Result<Vec<GeocodeResult>, Error>`):
+  `client.geocode("…")`, `client.reverse_geocode(lat, lng)`,
+  `client.geocode_place_id("…")`, `client.send(GeocodeRequest)`.
+  `client.send_response(GeocodeRequest)` returns the whole `GeocodeResponse`
+  (top-level `plus_code`, `address_descriptor`).
+- Build a request: `GeocodeRequest::address(&str)` / `::japan(&str)` /
+  `::reverse(f64, f64)` / `::place_id(&str)`, then `.language("ja")`, `.region("jp")`,
+  `.bounds(Bounds { southwest, northeast })`, `.component(Component::Country("JP"))`
+  (repeatable, ANDed), `.result_type("street_address")` (reverse),
+  `.location_type(LocationType::Rooftop)` (reverse), `.address_descriptors(true)` (beta).
+- Read a result: `r.location() -> LatLng`, `r.formatted_address`, `r.place_id`,
+  `r.geometry.location_type`, `r.postal_code()`, `r.prefecture()`, `r.locality()`,
+  `r.country()`, `r.component("route")`, `r.partial_match`, `r.plus_code`,
+  `r.postcode_localities`. `most_precise(&results)` picks the best `LocationType`
+  (ties keep Google's ordering).
+- Everything deserializes *and* serializes, so a response can be stored and replayed.
+
+## Behaviour worth stating correctly
+
+- `ZERO_RESULTS` is `Ok(vec![])`, not an error. Only real failures are `Err`.
+- `OVER_QUERY_LIMIT`, `UNKNOWN_ERROR`, HTTP 429/5xx, timeouts and connection failures are
+  retried with exponential backoff (default 3 retries, 500 ms doubling, capped at 8 s);
+  `RetryConfig::disabled()` turns it off. `Error::is_retryable()` exposes the same rule.
+- `REQUEST_DENIED` / `INVALID_REQUEST` / `OVER_DAILY_LIMIT` fail immediately — retrying
+  cannot fix a bad key, a malformed request or an exhausted daily quota.
+- The API key never appears in an error or in `Debug` output (URL stripped, `[REDACTED]`).
+- `GeocodingClient::new` sets a 10 s total HTTP timeout; `with_http_client` sets none.
+- Unknown `status` / `location_type` values parse into `Other(String)` instead of failing.
+- No caching, no jitter, no `Retry-After`, no `BUILDING_AND_ENTRANCES` — by design.
+
+## Minimal example
+
+```rust
+use uiuifree_gmaps_geocoder::{most_precise, GeocodingClient};
+
+#[tokio::main]
+async fn main() -> Result<(), uiuifree_gmaps_geocoder::Error> {
+    let client = GeocodingClient::new(std::env::var("GOOGLE_MAPS_API_KEY").unwrap());
+    let results = client.geocode("1600 Amphitheatre Parkway, Mountain View, CA").await?;
+    if let Some(best) = most_precise(&results) {
+        let loc = best.location();
+        println!("{} => {}, {}", best.formatted_address, loc.lat, loc.lng);
+    }
+    Ok(())
+}
+```
+
+## Links
+
+- [README (English)](https://github.com/uiuifree/rust-gmaps-geocoder/blob/main/README.md): full documentation, cookbook, FAQ
+- [README (日本語)](https://github.com/uiuifree/rust-gmaps-geocoder/blob/main/README.ja.md): Japanese documentation
+- [API docs](https://docs.rs/uiuifree-gmaps-geocoder): generated rustdoc for every public item
+- [crates.io](https://crates.io/crates/uiuifree-gmaps-geocoder): releases and versions
+- [AGENTS.md](https://github.com/uiuifree/rust-gmaps-geocoder/blob/main/AGENTS.md): contributor and AI-agent guide to the repository
+- [CHANGELOG.md](https://github.com/uiuifree/rust-gmaps-geocoder/blob/main/CHANGELOG.md): what changed in each release
+- [Google Geocoding API](https://developers.google.com/maps/documentation/geocoding/overview): the upstream API this wraps
+- [Google Maps Platform terms](https://cloud.google.com/maps-platform/terms): caching limit and attribution rules
